@@ -403,6 +403,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
+    [GGML_TYPE_DASHQ_2] = {
+        .from_float               = NULL,
+        .vec_dot                  = ggml_vec_dot_dashq_2_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_DASHQ_3] = {
+        .from_float               = NULL,
+        .vec_dot                  = ggml_vec_dot_dashq_3_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {

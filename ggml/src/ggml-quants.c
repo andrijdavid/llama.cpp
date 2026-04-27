@@ -5253,6 +5253,114 @@ void quantize_row_iq2_s_ref(const float * GGML_RESTRICT x, block_iq2_s * GGML_RE
     quantize_iq2_s(x, y, 1, k, NULL);
 }
 
+// =============================== DASH-Q quantization
+// Reference: arXiv:2604.13806v1
+// Dequant: w[i] = d * q[i] - z
+
+void dequantize_row_dashq_2(const block_dashq_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_DASHQ_2 == 0);
+    const int64_t nb = k / QK_DASHQ_2;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float z = GGML_FP16_TO_FP32(x[i].z);
+        for (int j = 0; j < QK_DASHQ_2; j++) {
+            const int q = (x[i].qs[j / 4] >> (2 * (j % 4))) & 0x03;
+            y[i * QK_DASHQ_2 + j] = d * (float)q - z;
+        }
+    }
+}
+
+void dequantize_row_dashq_3(const block_dashq_3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_DASHQ_3 == 0);
+    const int64_t nb = k / QK_DASHQ_3;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float z = GGML_FP16_TO_FP32(x[i].z);
+        for (int j = 0; j < QK_DASHQ_3; j++) {
+            const int lo = (x[i].qs[j / 4] >> (2 * (j % 4))) & 0x03;
+            const int hi = (x[i].qh[j / 8] >> (j % 8)) & 0x01;
+            const int q = lo | (hi << 2);
+            y[i * QK_DASHQ_3 + j] = d * (float)q - z;
+        }
+    }
+}
+
+void quantize_row_dashq_2_ref(const float * GGML_RESTRICT x, block_dashq_2 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_DASHQ_2 == 0);
+    const int64_t nb = k / QK_DASHQ_2;
+    for (int64_t i = 0; i < nb; i++) {
+        float xmin = x[i * QK_DASHQ_2], xmax = xmin;
+        for (int j = 1; j < QK_DASHQ_2; j++) {
+            float v = x[i * QK_DASHQ_2 + j];
+            if (v < xmin) xmin = v;
+            if (v > xmax) xmax = v;
+        }
+        const float d = (xmax - xmin) / 3.0f;
+        const float z = -xmin;
+        y[i].d = GGML_FP32_TO_FP16(d > 0 ? d : 1e-8f);
+        y[i].z = GGML_FP32_TO_FP16(z);
+        memset(y[i].qs, 0, QK_DASHQ_2 / 4);
+        const float id = d > 0 ? 1.0f / d : 0.0f;
+        for (int j = 0; j < QK_DASHQ_2; j++) {
+            int q = (int)(roundf((x[i * QK_DASHQ_2 + j] + z) * id));
+            if (q < 0) q = 0; if (q > 3) q = 3;
+            y[i].qs[j / 4] |= (uint8_t)(q << (2 * (j % 4)));
+        }
+    }
+}
+
+void quantize_row_dashq_3_ref(const float * GGML_RESTRICT x, block_dashq_3 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_DASHQ_3 == 0);
+    const int64_t nb = k / QK_DASHQ_3;
+    for (int64_t i = 0; i < nb; i++) {
+        float xmin = x[i * QK_DASHQ_3], xmax = xmin;
+        for (int j = 1; j < QK_DASHQ_3; j++) {
+            float v = x[i * QK_DASHQ_3 + j];
+            if (v < xmin) xmin = v;
+            if (v > xmax) xmax = v;
+        }
+        const float d = (xmax - xmin) / 7.0f;
+        const float z = -xmin;
+        y[i].d = GGML_FP32_TO_FP16(d > 0 ? d : 1e-8f);
+        y[i].z = GGML_FP32_TO_FP16(z);
+        memset(y[i].qs, 0, QK_DASHQ_3 / 4);
+        memset(y[i].qh, 0, QK_DASHQ_3 / 8);
+        const float id = d > 0 ? 1.0f / d : 0.0f;
+        for (int j = 0; j < QK_DASHQ_3; j++) {
+            int q = (int)(roundf((x[i * QK_DASHQ_3 + j] + z) * id));
+            if (q < 0) q = 0; if (q > 7) q = 7;
+            y[i].qs[j / 4] |= (uint8_t)((q & 0x03) << (2 * (j % 4)));
+            y[i].qh[j / 8] |= (uint8_t)(((q >> 2) & 0x01) << (j % 8));
+        }
+    }
+}
+
+size_t quantize_dashq_2(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    GGML_ASSERT(n_per_row % QK_DASHQ_2 == 0);
+    const int64_t nb = n_per_row / QK_DASHQ_2;
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_dashq_2_ref(src, (block_dashq_2 *)qrow, n_per_row);
+        src += n_per_row;
+        qrow += nb * sizeof(block_dashq_2);
+    }
+    return nrow * nb * sizeof(block_dashq_2);
+}
+
+size_t quantize_dashq_3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    GGML_ASSERT(n_per_row % QK_DASHQ_3 == 0);
+    const int64_t nb = n_per_row / QK_DASHQ_3;
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_dashq_3_ref(src, (block_dashq_3 *)qrow, n_per_row);
+        src += n_per_row;
+        qrow += nb * sizeof(block_dashq_3);
+    }
+    return nrow * nb * sizeof(block_dashq_3);
+}
+
 // =============================== data validation
 
 static bool validate_float(float f, size_t i) {
@@ -5572,6 +5680,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ4_NL:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
+            } break;
+
+        case GGML_TYPE_DASHQ_2:
+            {
+                VALIDATE_ROW_DATA_DM_F16_IMPL(block_dashq_2, data, nb, d, z);
+            } break;
+        case GGML_TYPE_DASHQ_3:
+            {
+                VALIDATE_ROW_DATA_DM_F16_IMPL(block_dashq_3, data, nb, d, z);
             } break;
 
         case GGML_TYPE_I8:

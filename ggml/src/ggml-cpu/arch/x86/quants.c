@@ -3968,3 +3968,129 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+// =========================================================================
+// DASH-Q dot products (AVX2). Falls back to the scalar generic on non-AVX2.
+// Block layout (ggml-common.h):
+//   block_dashq_2: ggml_half d, z; uint8_t qs[8]   (32 quants of 2 bits)
+//   block_dashq_3: ggml_half d, z; uint8_t qs[16], qh[8]  (64 quants, lo+hi)
+// Dequant: w[i] = d * q[i] - z
+// =========================================================================
+
+#if defined(__AVX2__)
+// Unpack 8 packed bytes into 32 unsigned bytes in {0,1,2,3}.
+// qs8 holds the 8 source bytes in its low half (lanes 0..7); high lanes ignored.
+static inline __m256i dashq2_unpack_lo2(__m128i qs8) {
+    const __m128i m3 = _mm_set1_epi8(0x03);
+    const __m128i v0 = _mm_and_si128(qs8, m3);
+    const __m128i v1 = _mm_and_si128(_mm_srli_epi16(qs8, 2), m3);
+    const __m128i v2 = _mm_and_si128(_mm_srli_epi16(qs8, 4), m3);
+    const __m128i v3 = _mm_and_si128(_mm_srli_epi16(qs8, 6), m3);
+    // Interleave so lane 4k+r holds bits [2r, 2r+1] of source byte k.
+    const __m128i lo01 = _mm_unpacklo_epi8(v0, v1);   // 16 bytes valid
+    const __m128i lo23 = _mm_unpacklo_epi8(v2, v3);
+    const __m128i q_lo = _mm_unpacklo_epi16(lo01, lo23);  // q[0..15]
+    const __m128i q_hi = _mm_unpackhi_epi16(lo01, lo23);  // q[16..31]
+    return MM256_SET_M128I(q_hi, q_lo);
+}
+
+// Reduce 32 (qx*qy) -> i32 sumi and 32 qy -> i32 sumz, accumulate as float.
+static inline __m256 dashq_block_contrib(__m256i qx_u8, __m256i qy_s8,
+                                         float xd, float xz, float yd) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i ones8  = _mm256_set1_epi8(1);
+    const __m256i p_qy   = _mm256_maddubs_epi16(qx_u8, qy_s8);
+    const __m256i p_y    = _mm256_maddubs_epi16(ones8, qy_s8);
+    const __m256i sumi_v = _mm256_madd_epi16(p_qy, ones16);
+    const __m256i sumz_v = _mm256_madd_epi16(p_y,  ones16);
+    const __m256  sumi_f = _mm256_cvtepi32_ps(sumi_v);
+    const __m256  sumz_f = _mm256_cvtepi32_ps(sumz_v);
+    const __m256  contrib = _mm256_sub_ps(_mm256_mul_ps(_mm256_set1_ps(xd), sumi_f),
+                                          _mm256_mul_ps(_mm256_set1_ps(xz), sumz_f));
+    return _mm256_mul_ps(_mm256_set1_ps(yd), contrib);
+}
+#endif
+
+void ggml_vec_dot_dashq_2_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                               const void * GGML_RESTRICT vx, size_t bx,
+                               const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    assert(n % QK_DASHQ_2 == 0);
+
+    const block_dashq_2 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+    const int nb = n / QK_DASHQ_2;
+
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; i++) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float xz = GGML_CPU_FP16_TO_FP32(x[i].z);
+        const float yd = GGML_CPU_FP16_TO_FP32(y[i].d);
+
+        const __m128i qs8 = _mm_loadl_epi64((const __m128i *)x[i].qs);
+        const __m256i qx  = dashq2_unpack_lo2(qs8);
+        const __m256i qy  = _mm256_loadu_si256((const __m256i *)y[i].qs);
+
+        acc = _mm256_add_ps(acc, dashq_block_contrib(qx, qy, xd, xz, yd));
+    }
+    *s = hsum_float_8(acc);
+#else
+    UNUSED(x); UNUSED(y); UNUSED(nb);
+    ggml_vec_dot_dashq_2_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+void ggml_vec_dot_dashq_3_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                               const void * GGML_RESTRICT vx, size_t bx,
+                               const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    assert(n % QK_DASHQ_3 == 0);
+
+    const block_dashq_3 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+    const int nb = n / QK_DASHQ_3;
+
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    const __m256i hi_perm = _mm256_setr_epi8(
+        0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1, 2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bit_mask = _mm256_setr_epi8(
+        1,2,4,8,16,32,64,(char)128, 1,2,4,8,16,32,64,(char)128,
+        1,2,4,8,16,32,64,(char)128, 1,2,4,8,16,32,64,(char)128);
+    const __m256i four = _mm256_set1_epi8(4);
+
+    for (int i = 0; i < nb; i++) {
+        const float xd = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float xz = GGML_CPU_FP16_TO_FP32(x[i].z);
+        const uint64_t qh64 = *(const uint64_t *)x[i].qh;
+
+        for (int half = 0; half < 2; half++) {
+            const float yd = GGML_CPU_FP16_TO_FP32(y[2*i+half].d);
+
+            // Low 2 bits: 8 qs bytes -> 32 u8 in 0..3.
+            const __m128i qs8 = _mm_loadl_epi64((const __m128i *)(x[i].qs + 8*half));
+            const __m256i qlo = dashq2_unpack_lo2(qs8);
+
+            // High bit: 4 qh bytes -> 32 u8 in {0, 4}.
+            const uint32_t qh32 = (uint32_t)(half == 0 ? qh64 : (qh64 >> 32));
+            const __m256i qh_raw   = _mm256_set1_epi32((int)qh32);
+            const __m256i hi_bytes = _mm256_shuffle_epi8(qh_raw, hi_perm);
+            const __m256i hi_masked = _mm256_and_si256(hi_bytes, bit_mask);
+            const __m256i hi_nz    = _mm256_cmpgt_epi8(hi_masked, _mm256_setzero_si256());
+            const __m256i hi_x4    = _mm256_and_si256(hi_nz, four);
+
+            const __m256i qx = _mm256_or_si256(qlo, hi_x4);  // 0..7
+            const __m256i qy = _mm256_loadu_si256((const __m256i *)y[2*i+half].qs);
+
+            acc = _mm256_add_ps(acc, dashq_block_contrib(qx, qy, xd, xz, yd));
+        }
+    }
+    *s = hsum_float_8(acc);
+#else
+    UNUSED(x); UNUSED(y); UNUSED(nb);
+    ggml_vec_dot_dashq_3_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}

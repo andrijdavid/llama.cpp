@@ -1286,3 +1286,69 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// ============================ DASH-Q dot products (generic scalar)
+// Dequant: w[i] = d * q[i] - z
+
+void ggml_vec_dot_dashq_2_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    assert(n % QK_DASHQ_2 == 0);
+
+    const block_dashq_2 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+    const int nb = n / QK_DASHQ_2;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d  = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float z  = GGML_CPU_FP16_TO_FP32(x[i].z);
+        const float yd = GGML_CPU_FP16_TO_FP32(y[i].d);
+
+        int sumi = 0;
+        float sumz = 0.0f;
+        for (int j = 0; j < QK_DASHQ_2; j++) {
+            const int q = (x[i].qs[j / 4] >> (2 * (j % 4))) & 0x03;
+            sumi += q * (int)y[i].qs[j];
+            sumz += (float)y[i].qs[j];
+        }
+        sumf += yd * (d * (float)sumi - z * sumz);
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_dashq_3_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+    assert(n % QK_DASHQ_3 == 0);
+
+    const block_dashq_3 * GGML_RESTRICT x = vx;
+    const block_q8_0    * GGML_RESTRICT y = vy;
+    const int nb = n / QK_DASHQ_3;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d  = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float z  = GGML_CPU_FP16_TO_FP32(x[i].z);
+
+        // DASHQ_3 block=64, Q8_0 block=32, so we span 2 Q8_0 blocks
+        for (int half = 0; half < 2; half++) {
+            const float yd = GGML_CPU_FP16_TO_FP32(y[2*i+half].d);
+            int sumi = 0;
+            float sumz = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                const int jj = half * 32 + j;
+                const int lo = (x[i].qs[jj / 4] >> (2 * (jj % 4))) & 0x03;
+                const int hi = (x[i].qh[jj / 8] >> (jj % 8)) & 0x01;
+                const int q = lo | (hi << 2);
+                sumi += q * (int)y[2*i+half].qs[j];
+                sumz += (float)y[2*i+half].qs[j];
+            }
+            sumf += yd * (d * (float)sumi - z * sumz);
+        }
+    }
+    *s = sumf;
+}
+
+// Per-arch override: see arch/x86/quants.c (AVX2). Other archs fall through
+// arch-fallback.h, which #defines `*_generic` to the unsuffixed name.

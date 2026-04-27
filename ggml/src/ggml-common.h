@@ -449,6 +449,31 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+//
+// DASH-Q quantization structures
+// Reference: arXiv:2604.13806v1
+// Dequant: w[i] = d * q[i] - z
+//
+
+// DASH-Q 2-bit: group_size = 32, 3.0 bpw
+#define QK_DASHQ_2 32
+typedef struct {
+    ggml_half d;
+    ggml_half z;
+    uint8_t qs[QK_DASHQ_2 / 4];
+} block_dashq_2;
+static_assert(sizeof(block_dashq_2) == 2*sizeof(ggml_half) + QK_DASHQ_2/4, "wrong dashq_2 block size/padding");
+
+// DASH-Q 3-bit: group_size = 64, 3.5 bpw
+#define QK_DASHQ_3 64
+typedef struct {
+    ggml_half d;
+    ggml_half z;
+    uint8_t qs[QK_DASHQ_3 / 4];
+    uint8_t qh[QK_DASHQ_3 / 8];
+} block_dashq_3;
+static_assert(sizeof(block_dashq_3) == 2*sizeof(ggml_half) + QK_DASHQ_3/4 + QK_DASHQ_3/8, "wrong dashq_3 block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
