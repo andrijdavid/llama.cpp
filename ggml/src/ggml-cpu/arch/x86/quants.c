@@ -4079,7 +4079,10 @@ void ggml_vec_dot_dashq_3_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
             const __m256i qh_raw   = _mm256_set1_epi32((int)qh32);
             const __m256i hi_bytes = _mm256_shuffle_epi8(qh_raw, hi_perm);
             const __m256i hi_masked = _mm256_and_si256(hi_bytes, bit_mask);
-            const __m256i hi_nz    = _mm256_cmpgt_epi8(hi_masked, _mm256_setzero_si256());
+            // Exact compare against the mask: a signed cmpgt(_, 0) would drop the
+            // top bit (mask 0x80 reads as -128), losing the MSB of every j%8==7
+            // weight. cmpeq is bit-exact for all eight positions.
+            const __m256i hi_nz    = _mm256_cmpeq_epi8(hi_masked, bit_mask);
             const __m256i hi_x4    = _mm256_and_si256(hi_nz, four);
 
             const __m256i qx = _mm256_or_si256(qlo, hi_x4);  // 0..7
